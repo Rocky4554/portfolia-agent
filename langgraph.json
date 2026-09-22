@@ -1,0 +1,15 @@
+{
+    "dockerfile_lines": [],
+    "graphs": {
+        "Portfolio Valuation Agent": "./portfolio_agent/nodes/graph.py:portfolio_agent",
+        "Portfolio Manager Agent": "./portfolio_agent/nodes/manager_graph.py:portfolio_manager_agent"
+    },
+    "http": {
+        "app": "./portfolio_agent/api.py:app"
+    },
+    "python_version": "3.11",
+    "env": "./.env",
+    "dependencies": [
+        "."
+    ]
+}

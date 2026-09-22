@@ -1,0 +1,19 @@
+.venv/
+__pycache__/
+*.pyc
+
+# Credentials. The bare `.env` line was not enough: a timestamped backup
+# (.env.bak-1789978469) was picked up by `git add -A` and committed with live
+# keys in it. Ignore the whole family and re-include only the template.
+.env
+.env.*
+!.env.example
+
+# Funding collector output
+funding_events.jsonl
+reports/
+logs/
+
+# Collected funding events (data, not code) — the store is rebuilt by the
+# collector and should not be versioned.
+data/funding/*.jsonl

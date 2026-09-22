@@ -1,0 +1,22 @@
+# SearXNG config for the free-first search provider in
+# portfolio_agent/tools/search.py. This instance is internal-only — no port
+# is published in docker-compose.yml, so only the langgraph-api container on
+# the compose network can reach it. That's also why the rate limiter and bot
+# detection built for a public instance are off: there is no public traffic
+# to defend against here, and they would otherwise block the JSON API calls
+# this app makes.
+use_default_settings: true
+
+general:
+  instance_name: "portfolio-agent search"
+
+server:
+  secret_key: "48284d8efc4d1b96aac63ce2b794be45315176d0c92789de73a4e4ef8934e304"
+  limiter: false
+  image_proxy: false
+
+search:
+  safe_search: 0
+  formats:
+    - html
+    - json
