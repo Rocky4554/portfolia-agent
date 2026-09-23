@@ -555,6 +555,70 @@ def _short(value, limit: int = 120) -> str:
     return rendered if len(rendered) <= limit else rendered[:limit] + "…"
 
 
+def generate_tier_relations_deterministic(section: Section) -> str:
+    """F22.1: Deterministic 'How the tiers relate' section.
+    
+    The LLM repeatedly produces false ratio prose ("by a factor of 1" for 1.44×,
+    "substantially... two times" for different-magnitude steps). This section is
+    computed from actual tier points instead of generated, making the ratio bug
+    structurally impossible.
+    
+    For each adjacent tier pair, compute the real ratio and pick the descriptor
+    from a fixed table, then state the exact multiple.
+    """
+    steps = (section.content or {}).get("steps") or []
+    if not steps:
+        return "The tiers could not be compared because insufficient market data was available."
+    
+    # Fixed descriptor table (ratio ranges → descriptive words)
+    # Thresholds chosen to match APVA §4.1.1 tier relationships
+    def ratio_descriptor(ratio: float) -> str:
+        if ratio < 1.3:
+            return "modestly"
+        elif ratio < 2.5:
+            return "substantially"
+        elif ratio < 5.0:
+            return "sharply"
+        else:
+            return "dramatically"
+    
+    sentences = []
+    for step in steps:
+        from_tier = step.get("from", "")
+        to_tier = step.get("to", "")
+        from_point = step.get("from_point", 0)
+        to_point = step.get("to_point", 0)
+        multiple = step.get("multiple", 1.0)
+        
+        if not from_tier or not to_tier or from_point <= 0 or to_point <= 0:
+            continue
+        
+        # Strip the "—" explanation from tier labels for readability
+        from_label = from_tier.split("—")[0].strip()
+        to_label = to_tier.split("—")[0].strip()
+        
+        descriptor = ratio_descriptor(multiple)
+        
+        sentences.append(
+            f"{from_label} (${from_point:,}) to {to_label} (${to_point:,}) — "
+            f"{descriptor}, about {multiple:.1f}×"
+        )
+    
+    if not sentences:
+        return "The tiers could not be compared due to insufficient data."
+    
+    prose = ". ".join(sentences) + "."
+    
+    # Add context about what the relationships mean
+    context = (
+        " These multiples reflect the different buyer pools and risk profiles at each level: "
+        "investor demand in a competitive auction sits below brokered end-user negotiations, "
+        "which in turn sit below premium Buy-It-Now asks that factor in seller patience and scarcity."
+    )
+    
+    return prose + context
+
+
 async def generate_section(llm, section: Section, view: RationaleView) -> tuple[str, list[str]]:
     """One section, validated, with one retry then a templated fallback.
 
@@ -563,6 +627,14 @@ async def generate_section(llm, section: Section, view: RationaleView) -> tuple[
     because one figure in it was wrong — which is what the whole-rationale
     fallback did.
     """
+    # F22.1: Deterministic generation for tier_relations section.
+    # The LLM repeatedly produces false ratio prose, so this section is computed
+    # from tier points instead of generated.
+    if section.key == "tier_relations":
+        deterministic_prose = generate_tier_relations_deterministic(section)
+        info(log, "rationale.section_deterministic", section=section.key, chars=len(deterministic_prose))
+        return deterministic_prose, []
+    
     prompt = (
         f"SECTION: {section.heading}\n"
         f"YOUR TASK: {section.instruction}\n\n"

@@ -37,7 +37,19 @@ _builder.add_node("rationale", rationale)
 _builder.set_entry_point("classify")
 _builder.add_edge("classify", "gather_evidence")
 _builder.add_edge("gather_evidence", "synthesize")
-_builder.add_edge("synthesize", "rationale")
+
+
+def _after_synthesize(state: PortfolioAgentState) -> str:
+    # A backtest scores the tiers. The rationale is prose about numbers that
+    # are already final, and it is the slow, billed part of a run.
+    if state.get("skip_rationale"):
+        return "end"
+    return "rationale"
+
+
+_builder.add_conditional_edges(
+    "synthesize", _after_synthesize, {"rationale": "rationale", "end": END},
+)
 _builder.add_edge("rationale", END)
 
 portfolio_agent = _builder.compile()

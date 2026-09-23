@@ -1,0 +1,16 @@
+# Ground-truth sales for the backtest.
+# Required columns: domain, actual_price, sale_date, sale_tier
+# sale_tier is the engine tier to score against the price that was paid:
+#   floor, auction, end_user, list_bin, strategic_ma
+# sale_date is YYYY-MM-DD. The engine is not allowed to see this domain's
+# sale, or any comp dated on or after that day.
+#
+# Where the rows come from, best source first:
+#   1. Namekart's own closed book (private sales the public feeds never saw)
+#   2. NameBio, using only sales from a recent window (the date cutoff hides them)
+#   3. DNJournal weekly reports, for the six- and seven-figure end of the range
+#
+# Delete these instructions and add one row per closed sale. Forty to fifty
+# rows, spread across the categories and extensions you actually sell, is
+# enough for a first measured error.
+domain,actual_price,sale_date,sale_tier

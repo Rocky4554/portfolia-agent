@@ -20,3 +20,13 @@ search:
   formats:
     - html
     - json
+
+# DuckDuckGo answers this server with a CAPTCHA, so it is removed rather
+# than queried on every search. Wikidata's SPARQL call to query.wikidata.org
+# regularly exceeds the 3s default and only fills an infobox the valuation
+# client does not read; 10s lets that call finish before the result set closes.
+engines:
+  - name: duckduckgo
+    inactive: true
+  - name: wikidata
+    timeout: 10.0

@@ -44,7 +44,7 @@ SOURCE = "sec_edgar"
 _TIMEOUT_S = 25.0
 _TICKERS_URL = "https://www.sec.gov/files/company_tickers.json"
 _SUBMISSIONS = "https://data.sec.gov/submissions/CIK{cik:010d}.json"
-_CONCEPT = "https://data.sec.gov/api/xbrl/companyconcept/CIK{cik:010d}/us-gaap/{concept}.json"
+_COMPANYFACTS = "https://data.sec.gov/api/xbrl/companyfacts/CIK{cik:010d}.json"
 
 # SIC ranges to the verticals in knowledge/industries.py. Ranges rather than
 # codes because SIC is hierarchical and the leaves are far more specific than
@@ -245,14 +245,22 @@ async def _company_detail(cik: int) -> tuple[dict | None, str | None]:
 
 
 async def _revenue(cik: int) -> tuple[int | None, str | None]:
-    """Most recent annual revenue, under whichever tag the filer used."""
+    """Most recent annual revenue, under whichever tag the filer used.
+    
+    Uses the companyfacts bulk endpoint rather than per-concept queries
+    to avoid 404s on companies that report revenue under different tags.
+    """
+    body, error = await request_json(
+        "GET", _COMPANYFACTS.format(cik=cik),
+        headers=_headers(), timeout=_TIMEOUT_S, max_attempts=1)
+    if error or not isinstance(body, dict):
+        return None, f"companyfacts fetch failed: {error}"
+    
+    facts = body.get("facts", {}).get("us-gaap", {})
     for concept in _REVENUE_CONCEPTS:
-        body, error = await request_json(
-            "GET", _CONCEPT.format(cik=cik, concept=concept),
-            headers=_headers(), timeout=_TIMEOUT_S, max_attempts=1)
-        if error or not isinstance(body, dict):
+        if concept not in facts:
             continue
-        rows = [r for r in ((body.get("units") or {}).get("USD") or [])
+        rows = [r for r in ((facts[concept].get("units") or {}).get("USD") or [])
                 if isinstance(r, dict) and r.get("form") == "10-K" and r.get("val")]
         if not rows:
             continue

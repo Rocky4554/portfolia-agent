@@ -5,6 +5,8 @@ volumes:
 services:
     searxng:
         image: searxng/searxng:latest
+        ports:
+            - "8080:8080"
         volumes:
             - ./searxng:/etc/searxng:rw
         cap_drop:

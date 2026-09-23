@@ -23,7 +23,10 @@ leave this function. A broker's book contains names, emails and negotiation
 history, and none of it needs to reach a prompt or a log to value a domain.
 """
 
+import csv
 from dataclasses import dataclass, field
+from datetime import date
+from pathlib import Path
 
 from portfolio_agent import config
 from portfolio_agent.logging_setup import debug, get_logger, info
@@ -53,7 +56,12 @@ class InternalSignals:
 
 
 async def fetch_internal_comps(
-    keywords: list[str] | None = None, tld: str | None = None, category: str = ""
+    keywords: list[str] | None = None,
+    tld: str | None = None,
+    category: str = "",
+    *,
+    before: str | date | None = None,
+    exclude_domain: str | None = None,
 ) -> ToolResult:
     """Closed sales from our own book, in the shape the ladder reads comps.
 
@@ -67,6 +75,17 @@ async def fetch_internal_comps(
 
     if config.MOCK_MODE:
         return mock_result(SOURCE, _mock_comps(keywords, tld), data_age_days=9)
+    if config.INTERNAL_COMPS_CSV:
+        try:
+            comps = load_book(
+                config.INTERNAL_COMPS_CSV, before=before, exclude_domain=exclude_domain,
+            )
+        except OSError as exc:
+            return error_result(SOURCE, f"could not read INTERNAL_COMPS_CSV: {exc}")
+        info(log, "internal_comps.fetched", keywords=len(keywords), tld=tld,
+             comps=len(comps), source="csv", before=str(before or ""),
+             excluded=exclude_domain or "")
+        return ok_result(SOURCE, {"keywords": keywords, "tld": tld, "comp_count": len(comps), "comps": comps})
     if not (config.INTERNAL_COMPS_URL and config.INTERNAL_COMPS_TOKEN):
         return error_result(SOURCE, "no INTERNAL_COMPS_URL / INTERNAL_COMPS_TOKEN configured")
 
@@ -83,6 +102,7 @@ async def fetch_internal_comps(
     rows = _rows(body, ("sales", "results", "data"))
     comps = [_strip_sale(row) for row in rows]
     comps = [c for c in comps if c["price"] > 0]
+    comps = _apply_holdout(comps, before=before, exclude_domain=exclude_domain)
     info(log, "internal_comps.fetched", keywords=len(keywords), tld=tld, comps=len(comps))
     return ok_result(SOURCE, {"keywords": keywords, "tld": tld, "comp_count": len(comps), "comps": comps})
 
@@ -121,6 +141,73 @@ async def fetch_internal_signals(domain: str) -> ToolResult:
 # ── Boundary ───────────────────────────────────────────────────────────────
 
 
+def load_book(
+    path: str | Path,
+    *,
+    before: str | date | None = None,
+    exclude_domain: str | None = None,
+) -> list[dict]:
+    """Closed sales from a CSV, reduced to comp fields and holdout-filtered.
+
+    The same file can be the ground-truth list and the book. On the turn
+    that grades one row, that domain is excluded and anything dated on or
+    after its sale is excluded, so the other rows are comps and the row
+    itself is not.
+    """
+    cutoff = _parse_day(before)
+    subject = (exclude_domain or "").strip().lower()
+    comps = []
+    with Path(path).open(newline="", encoding="utf-8") as handle:
+        lines = [line for line in handle if line.strip() and not line.lstrip().startswith("#")]
+    for row in csv.DictReader(lines):
+        sale = _strip_sale(row)
+        if sale["price"] <= 0 or not sale["domain"]:
+            continue
+        if not _kept(sale, cutoff=cutoff, subject=subject):
+            continue
+        comps.append(sale)
+    return comps
+
+
+def _apply_holdout(comps: list[dict], *, before, exclude_domain: str | None) -> list[dict]:
+    cutoff = _parse_day(before)
+    if cutoff is None and not exclude_domain:
+        return comps
+    subject = (exclude_domain or "").strip().lower()
+    return [c for c in comps if _kept(c, cutoff=cutoff, subject=subject)]
+
+
+def _kept(sale: dict, *, cutoff: date | None, subject: str) -> bool:
+    """A book row may be a comp only if it was already closed, and it is not the answer."""
+    if subject and sale["domain"] == subject:
+        return False
+    if cutoff is None:
+        return True
+    sold = _parse_day(sale.get("date"))
+    return sold is not None and sold < cutoff
+
+
+def _parse_day(value) -> date | None:
+    if value is None or value == "":
+        return None
+    if isinstance(value, date):
+        return value
+    try:
+        return date.fromisoformat(str(value)[:10])
+    except ValueError:
+        return None
+
+
+def _money(value) -> float:
+    if value is None or value == "":
+        return 0.0
+    text = str(value).replace("$", "").replace(",", "").strip()
+    try:
+        return float(text)
+    except ValueError:
+        return 0.0
+
+
 def _strip_sale(row: dict) -> dict:
     """A closed sale, reduced to the four fields a comp needs.
 
@@ -131,8 +218,8 @@ def _strip_sale(row: dict) -> dict:
     """
     return {
         "domain": str(row.get("domain") or "").lower(),
-        "price": float(row.get("price") or row.get("sale_price") or 0),
-        "date": str(row.get("date") or row.get("closed_at") or "")[:10] or None,
+        "price": _money(row.get("price") or row.get("sale_price") or row.get("actual_price")),
+        "date": str(row.get("date") or row.get("sale_date") or row.get("closed_at") or "")[:10] or None,
         "venue": "internal",
     }
 

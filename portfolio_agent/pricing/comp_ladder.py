@@ -140,6 +140,10 @@ class LadderInputs:
     brand_score: float | None = None
     structural: dict | None = None
     today: date | None = None
+    # Exclusive upper bound for a time-holdout. Sales of `domain` itself,
+    # sales dated on or after this day, and undated rows are dropped, so a
+    # backtest cannot be graded on the sale it is predicting.
+    as_of: date | None = None
 
 
 PREMIUM, MID, COMMODITY = "premium", "mid", "commodity"
@@ -330,7 +334,8 @@ def build_comp_set(
             result.confidence = config.COMP_BASIS_CONFIDENCE[basis.value]
             _apply_band_weights(result, inputs)
             _apply_industry_weights(result, inputs)
-            _note_comp_dating(result, inputs, inputs.today)
+            _note_comp_dating(result, inputs, inputs.as_of or inputs.today)
+            _note_holdout(result, inputs)
             _apply_peer_floor(result, inputs, band)
             _apply_internal_lift(result)
             _annotate(result, inputs, basis)
@@ -361,7 +366,8 @@ def build_comp_set(
         )
         _apply_band_weights(result, inputs)
         _apply_industry_weights(result, inputs)
-        _note_comp_dating(result, inputs, inputs.today)
+        _note_comp_dating(result, inputs, inputs.as_of or inputs.today)
+        _note_holdout(result, inputs)
         _apply_peer_floor(result, inputs, band)
         result.notes.append(
             f"every basis was tried and none produced {minimum} comps with {min_peers} in the "
@@ -373,6 +379,7 @@ def build_comp_set(
 
     result.basis = CompBasis.NONE
     result.confidence = 0.0
+    _note_holdout(result, inputs)
     result.notes.append(
         f"no comparable sales at any basis — {len(result.comps)} found, {minimum} needed"
     )
@@ -381,6 +388,44 @@ def build_comp_set(
 
 
 # ── Rungs ──────────────────────────────────────────────────────────────────
+
+
+def _is_exact_match(subject_sld: str, comp_sld: str, terms: list[str]) -> bool:
+    """Check if a comp's SLD is an exact match for the subject.
+    
+    For single-token subjects (pay, isotope), an "exact" comp must have the
+    SAME SLD, not merely contain the subject term. Allowed equivalences:
+    - Exact equality: pay == pay
+    - Plural variants: isotope == isotopes
+    - Hyphen variants: pay == pay-pal is NOT equal (different word)
+    
+    Multi-token subjects use the old substring logic since they're already
+    compound names where the keyword appearing is meaningful.
+    """
+    subject_sld = subject_sld.lower().strip()
+    comp_sld = comp_sld.lower().strip()
+    
+    # Exact equality always matches
+    if subject_sld == comp_sld:
+        return True
+    
+    # Plural equivalence: isotope <-> isotopes
+    if subject_sld + "s" == comp_sld or comp_sld + "s" == subject_sld:
+        return True
+    
+    # If subject is a single token (no hyphens, no numbers, clean word),
+    # require strict equality. Multi-token or compound subjects can use
+    # substring matching since they're already compound names.
+    from portfolio_agent.knowledge.lexicon import segment
+    subject_segments = segment(subject_sld)
+    
+    # Single-token subject: strict match only (already checked above)
+    if len(subject_segments) <= 1 and "-" not in subject_sld:
+        return False
+    
+    # Multi-token subject: fall back to substring match
+    # (the old behavior for compound names)
+    return any(term in comp_sld for term in terms)
 
 
 def _step_exact(inputs: LadderInputs) -> list[CompRef]:
@@ -392,24 +437,33 @@ def _step_exact(inputs: LadderInputs) -> list[CompRef]:
     `exact` at confidence 1.0, and never reached for the cohort that
     actually defines its class. Ten neighbours read as certainty.
 
-    A comp qualifies here only if the term appears in it, or it is the same
-    name on the same extension. Everything else is a cohort member and is
-    priced as one, at cohort confidence.
+    A comp qualifies here only if it is the SAME asset class — for a
+    single-token subject, the SLD must equal the subject SLD (different TLD
+    allowed) OR match under a defined equivalence (plural/hyphen).
+    paydayloans.ai is NOT an exact comp for pay.ai — it's a different SLD.
+    Everything else is a cohort member and is priced as one, at cohort
+    confidence.
     """
     terms = [t.lower() for t in (inputs.keywords or [inputs.sld]) if t]
     comps = []
+    rejected_substring = 0
     for row in list(inputs.keyword_sales) + list(inputs.internal_sales):
         tld = _tld_of(row)
         if tld and tld != inputs.tld:
             continue
-        if not _recent_enough(row, inputs.today):
+        if not _admissible(row, inputs):
             continue
         sld = str(row.get("domain") or "").lower().partition(".")[0]
         internal = row in inputs.internal_sales
         # Own-book sales are matched by the caller's query, so they are
         # trusted without a substring check; public feed rows are not.
-        if not internal and terms and not any(term in sld for term in terms):
-            continue
+        if not internal and terms:
+            # F17.1: Exact match means SAME ASSET CLASS, not "substring appears".
+            # For a single-token subject, the comp's SLD must equal the subject
+            # SLD or match under defined equivalence (plural, hyphen variants).
+            if not _is_exact_match(inputs.sld, sld, terms):
+                rejected_substring += 1
+                continue
         comps.append(
             _comp(
                 row,
@@ -417,6 +471,9 @@ def _step_exact(inputs: LadderInputs) -> list[CompRef]:
                 weight=config.COMP_WEIGHT_INTERNAL if internal else config.COMP_WEIGHT_EXACT,
             )
         )
+    if rejected_substring > 0:
+        info(log, "comp_ladder.exact_match_rejected", count=rejected_substring,
+             reason="substring_not_equal", subject=inputs.sld)
     return comps
 
 
@@ -432,7 +489,7 @@ def _internal_comps(inputs: LadderInputs, tld_must_match: bool) -> list[CompRef]
         tld = _tld_of(row)
         if tld_must_match and tld and tld != inputs.tld:
             continue
-        if not _recent_enough(row, inputs.today):
+        if not _admissible(row, inputs):
             continue
         comps.append(
             _comp(row, source="internal_comps", weight=config.COMP_WEIGHT_INTERNAL,
@@ -456,7 +513,7 @@ def _step_cross_tld(inputs: LadderInputs) -> list[CompRef]:
             continue
         if tld not in config.CROSS_TLD_SET and inputs.tld not in config.CROSS_TLD_SET:
             continue
-        if not _recent_enough(row, inputs.today):
+        if not _admissible(row, inputs):
             continue
         ratio = transfer_ratio(tld, inputs.tld)
         comps.append(
@@ -485,7 +542,7 @@ def _step_cohort(inputs: LadderInputs) -> list[CompRef]:
         tld = _tld_of(row)
         if tld and tld != inputs.tld:
             continue
-        if not _recent_enough(row, inputs.today):
+        if not _admissible(row, inputs):
             continue
         comps.append(_comp(row, source="comparables", adjustment_reason="same structural cohort"))
     return _dedupe_by_domain(comps)
@@ -504,12 +561,18 @@ def _dedupe_by_domain(comps: list[CompRef]) -> list[CompRef]:
 def _step_keyword_only(inputs: LadderInputs) -> list[CompRef]:
     """Aggregate keyword statistics, with no individual sale behind them.
 
+    Skipped on a holdout. The aggregate is undated, so it may already
+    contain the sale being predicted, and a backtest that used it would be
+    grading the engine on an average that includes the answer.
+
     The weakest rung by a distance, and it is included because the
     alternative is silence. A synthesized comp says "sales containing this
     keyword average $X across Y transactions" — which is a real fact about a
     real market, just not about any one domain. It is labeled as synthesized
     so nothing downstream can mistake it for a sale that happened.
     """
+    if inputs.as_of is not None:
+        return []
     comps = []
     for keyword, stats in (inputs.keyword_stats or {}).items():
         count = stats.get("total_sales") or stats.get("count") or 0
@@ -660,6 +723,42 @@ def _tld_of(row: dict) -> str:
 def _date_of(row: dict) -> str | None:
     value = row.get("date") or row.get("saleDate")
     return str(value)[:10] if value else None
+
+
+def _note_holdout(result: CompSet, inputs: LadderInputs) -> None:
+    if inputs.as_of is None:
+        return
+    result.notes.append(
+        f"holdout as of {inputs.as_of.isoformat()}: {inputs.domain} itself, any sale on or after "
+        f"that date, and undated keyword aggregates are excluded, so this price is not graded "
+        f"on the sale it is predicting"
+    )
+    info(log, "comp_ladder.holdout", domain=inputs.domain, as_of=inputs.as_of.isoformat())
+
+
+def _admissible(row: dict, inputs: LadderInputs) -> bool:
+    """Whether this sale may enter the ladder.
+
+    Live runs keep the old rule: undated sales stay, and only sales older
+    than the staleness window are dropped. A holdout is stricter, because
+    the question has changed from "is this sale stale?" to "could this sale
+    have been known on the morning of the sale we are grading?"
+    """
+    if inputs.as_of is None:
+        return _recent_enough(row, inputs.today)
+    domain = str(row.get("domain") or "").strip().lower()
+    if domain and domain == inputs.domain.strip().lower():
+        return False
+    raw = _date_of(row)
+    if not raw:
+        return False
+    try:
+        sold = date.fromisoformat(raw)
+    except ValueError:
+        return False
+    if sold >= inputs.as_of:
+        return False
+    return _recent_enough(row, inputs.as_of)
 
 
 def _recent_enough(row: dict, today: date | None) -> bool:

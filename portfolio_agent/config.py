@@ -282,6 +282,24 @@ CATEGORY_KILLER_MIN_CASES = 3
 # substring comps comes out near $9,000 against a real $35.6M sale.
 APPRAISAL_DISAGREEMENT_FACTOR = 10.0
 
+# F17.2: Plausibility gate — confidence cap when comps are implausible.
+# When comps-derived end_user falls below the independent appraisal OR below
+# the category floor, confidence is capped at this level regardless of stated
+# basis. Prevents "confident and wrong" (pay.ai $564 at conf 1.0).
+IMPLAUSIBLE_CONF = float(os.environ.get("PORTFOLIO_AGENT_IMPLAUSIBLE_CONF", "0.3"))
+
+# F18: Live-ask reconciliation — when a live asking price disagrees with comps.
+# If the ask is more than this factor away from comps-derived end_user, emit
+# a warning and cap confidence. A live seller pricing this exact domain today
+# is strong evidence the cohort may overstate or understate it.
+ASK_GAP_HIGH = float(os.environ.get("PORTFOLIO_AGENT_ASK_GAP_HIGH", "5.0"))
+ASK_CONFLICT_CONF = float(os.environ.get("PORTFOLIO_AGENT_ASK_CONFLICT_CONF", "0.5"))
+
+# F21: Lander timeout — reduced from 12-24s which nearly doubled runtime for
+# zero information. Acquirability should fuse signals from RDAP, lander,
+# name.ai, and live asks rather than depend on lander alone.
+LANDER_TIMEOUT_S = float(os.environ.get("PORTFOLIO_AGENT_LANDER_TIMEOUT_S", "6.0"))
+
 # No reported sale probability may reach 1.0. A liquidity adjustment on a
 # high baseline probability can arithmetically exceed 1 and clamp there, and
 # "100% chance of sale" is a claim about the future that no evidence
@@ -561,6 +579,11 @@ DYNADOT_APPRAISAL_PATH = os.environ.get("DYNADOT_APPRAISAL_PATH", "/domains/{dom
 # exactly the inventory we broker — and the only ones nobody else has.
 INTERNAL_COMPS_URL = os.environ.get("INTERNAL_COMPS_URL", "")
 INTERNAL_COMPS_TOKEN = os.environ.get("INTERNAL_COMPS_TOKEN", "")
+# A CSV of closed sales, used when the book is a file rather than an API.
+# Columns: domain, actual_price (or price), sale_date (or date). When both
+# this and the URL are set, the file wins — a backtest must not also call
+# out for the same book.
+INTERNAL_COMPS_CSV = os.environ.get("INTERNAL_COMPS_CSV", "")
 
 # Own-book sales are better evidence than any aggregate, so a comp set
 # containing enough of them is not honestly described by its weakest rung. A

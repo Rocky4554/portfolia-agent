@@ -67,6 +67,8 @@ class EvidenceContext:
         self.category: str = state.get("category", "generic")
         self.keywords: list[str] = state.get("keywords") or []
         self.words: list[str] = state.get("words") or []
+        # YYYY-MM-DD when this run is a backtest holdout; None on a live valuation.
+        self.comp_as_of: str | None = state.get("comp_as_of") or None
 
     def primary_keyword(self, params: dict) -> str | None:
         """The term to query keyword tools with.
@@ -161,7 +163,10 @@ async def _run_internal_comps(ctx: EvidenceContext, params: dict) -> ToolResult:
     everywhere downstream: closed sales become comps, offers and inquiries
     become a demand reading. An offer is a price nobody paid.
     """
-    comps = await internal_comps.fetch_internal_comps(ctx.keywords, ctx.tld, ctx.category)
+    comps = await internal_comps.fetch_internal_comps(
+        ctx.keywords, ctx.tld, ctx.category,
+        before=ctx.comp_as_of, exclude_domain=ctx.domain if ctx.comp_as_of else None,
+    )
     signals = await internal_comps.fetch_internal_signals(ctx.domain)
     if not comps["ok"]:
         return comps
@@ -580,6 +585,7 @@ def _ladder_inputs(state: PortfolioAgentState, tool_results: dict, cohort_overri
                 "total_sales": all_tlds.get("count"),
             }
 
+    as_of = _as_of(state.get("comp_as_of"))
     return LadderInputs(
         domain=state["domain"], sld=sld, tld=tld,
         category=state.get("category", "generic"),
@@ -589,7 +595,22 @@ def _ladder_inputs(state: PortfolioAgentState, tool_results: dict, cohort_overri
         keyword_stats=keyword_stats,
         brand_score=(_data_of(tool_results, TOOL_BRAND_SCORE) or {}).get("brand_score"),
         structural=_structural_of(state),
+        # Age the comps as of the holdout morning, not as of whenever the
+        # backtest happens to be run.
+        today=as_of,
+        as_of=as_of,
     )
+
+
+def _as_of(value: str | None):
+    from datetime import date
+
+    if not value:
+        return None
+    try:
+        return date.fromisoformat(str(value)[:10])
+    except ValueError:
+        return None
 
 
 def _data_of(tool_results: dict, tool_id: str) -> dict | None:

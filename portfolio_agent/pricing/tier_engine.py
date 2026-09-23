@@ -789,10 +789,42 @@ def end_user_price(inputs: TierInputs, auction: PriceTier | None) -> tuple[Price
     adjustments = Adjustments()
     warnings: list[str] = []
 
+    # F20.1: Decouple brand quality from demand — gate the brand premium by
+    # commercial intent. Brand score measures phonetic/structural quality
+    # (isotope is pronounceable), but demand determines whether that quality
+    # commands a premium (isotope is niche). High-brand, low-demand words get
+    # a reduced premium; high-brand, high-demand words keep it.
     if inputs.brand_score is not None:
         low, high = config.END_USER_BRAND_RANGE
-        factor = low + (high - low) * (inputs.brand_score.total / 100.0)
-        adjustments.apply(factor, f"brand score {inputs.brand_score.total:.0f}/100")
+        base_brand_factor = low + (high - low) * (inputs.brand_score.total / 100.0)
+        
+        # Compute demand factor from commercial intent and category demand
+        resolved_intent = inputs.intent or {}
+        intent = resolved_intent.get("intent") or classify_intent(inputs.sld)[0]
+        # Check if intent is "commercial" (the only high-demand intent)
+        commercial_share = 1.0 if intent == "commercial" else 0.3
+        
+        # Category-specific demand (some categories inherently have more buyers)
+        category_demand = config.CATEGORY_LIQUIDITY.get(inputs.category, config.CATEGORY_LIQUIDITY_DEFAULT)
+        demand_factor = (commercial_share * 0.7 + category_demand * 0.3)
+        
+        # Effective brand multiplier = 1 + (brand_mult - 1) × demand_factor
+        # High brand + high demand: full premium (demand_factor ~1.0)
+        # High brand + low demand: reduced premium (demand_factor ~0.3-0.5)
+        effective_brand_factor = 1.0 + (base_brand_factor - 1.0) * demand_factor
+        
+        if demand_factor < 0.7:
+            adjustments.apply(
+                effective_brand_factor,
+                f"brand score {inputs.brand_score.total:.0f}/100, gated by demand "
+                f"(intent: {intent}, category liquidity: {category_demand:.2f}) — "
+                f"high-brand but low-demand words earn a reduced premium"
+            )
+        else:
+            adjustments.apply(
+                effective_brand_factor,
+                f"brand score {inputs.brand_score.total:.0f}/100"
+            )
 
     volume = _search_volume(inputs)
     if volume:
@@ -897,6 +929,17 @@ def end_user_price(inputs: TierInputs, auction: PriceTier | None) -> tuple[Price
             f"end_user: {trademark['detail']}. No trademark SEARCH has been run; only the "
             f"famous-mark screen. Table 4.1.1's deflator is applied only where that screen "
             f"fires, so an ordinary registered mark would pass through unnoticed.")
+    
+    # F20.1: TLD discount — apply per-TLD multiplier after all other adjustments.
+    # A great word on .co is still a .co. isotope.co should land near its comp
+    # median, not 4.7x above it.
+    from portfolio_agent.knowledge.tld_tier import get_tld_multiplier
+    tld_mult = get_tld_multiplier(inputs.tld)
+    if tld_mult != 1.0:
+        adjustments.apply(
+            tld_mult,
+            f".{inputs.tld} TLD discount (×{tld_mult:.2f}) — extension-specific pricing adjustment"
+        )
 
     return (
         _tier(anchor * adjustments.multiplier, band_ratios(stats, inputs.comp_confidence), adjustments,
@@ -998,6 +1041,18 @@ def list_bin_price(inputs: TierInputs, end_user: PriceTier | None) -> tuple[Pric
                 "is currently underpriced. The BIN is not capped to a figure under its own anchor, "
                 "so no tier was changed."
             )
+    
+    # F20.1: TLD discount — also apply to list_bin (it's a premium on end_user,
+    # which already has the discount, but the multiplier is explicit here for
+    # consistency and auditability).
+    from portfolio_agent.knowledge.tld_tier import get_tld_multiplier
+    tld_mult = get_tld_multiplier(inputs.tld)
+    if tld_mult != 1.0:
+        adjustments.apply(
+            tld_mult,
+            f".{inputs.tld} TLD discount (×{tld_mult:.2f}) — extension-specific pricing adjustment"
+        )
+        point = point * tld_mult
 
     markup = (point / end_user.point) if end_user.point else 1.0
 
@@ -1170,6 +1225,22 @@ def compute_market_tiers(inputs: TierInputs) -> tuple[TierSet, list[str]]:
     warnings.extend(listing_warnings)
 
     tiers = TierSet(floor=floor, auction=auction, end_user=end_user, list_bin=list_bin)
+    
+    # F17.2: Plausibility gate — check comps-derived end_user against sanity bounds.
+    # Runs BEFORE tier order enforcement so implausible comps get flagged even
+    # when they happen to sit in the right order.
+    plausibility_warning = check_plausibility(inputs, tiers)
+    if plausibility_warning:
+        warnings.append(plausibility_warning)
+    
+    # F18.1: Ask reconciliation — cross-check live asking price against comps.
+    # The ask never enters comps (WS3 quarantine), but a live seller pricing
+    # this exact domain is strong evidence and must not be silently dropped.
+    ask_signals, ask_warning = check_ask_reconciliation(inputs, tiers)
+    if ask_warning:
+        warnings.append(ask_warning)
+    # TODO: Surface ask_signals in evidence for rationale to cite
+    
     warnings.extend(enforce_tier_order(tiers))
 
     trend_warning = (inputs.trend or {}).get("staleness_warning")
@@ -1193,6 +1264,199 @@ def compute_market_tiers(inputs: TierInputs) -> tuple[TierSet, list[str]]:
         warnings.append(conflict)
 
     return tiers, warnings
+
+
+def check_ask_reconciliation(inputs: TierInputs, tiers: TierSet) -> tuple[dict | None, str | None]:
+    """F18.1: Ask-vs-model check — reconcile live asking price with comps-derived tiers.
+    
+    When a live ask exists for the exact subject domain, compute the gap between
+    it and the comps-derived end_user. If the gap exceeds thresholds, emit a
+    warning and cap confidence — a live human pricing this exact domain today is
+    strong real-world evidence, never silent.
+    
+    The ask NEVER enters the comps (WS3 quarantine holds). It is a cross-check,
+    not an input.
+    
+    Returns (signals_dict, warning_str). The signals dict is surfaced in evidence
+    so the rationale can cite it.
+    """
+    if tiers.end_user is None or tiers.end_user.point <= 0:
+        return None, None
+    
+    # Extract live ask from listings
+    listings = inputs.listings or {}
+    ask = listings.get("lowest_ask")
+    if not ask or ask <= 0:
+        return None, None
+    
+    comps_end_user = tiers.end_user.point
+    ask_ratio = comps_end_user / ask
+    
+    # Check thresholds
+    gap_high = config.ASK_GAP_HIGH
+    triggered = False
+    verdict = "aligned"
+    
+    if ask < comps_end_user / gap_high:
+        # Seller pricing far below model
+        triggered = True
+        verdict = "seller_below_model"
+        reason = (
+            f"live ask ${ask:,} is {ask_ratio:.1f}x below the comps-derived end_user "
+            f"${comps_end_user:,}. A motivated seller pricing this exact domain today is "
+            f"strong evidence the cohort overstates it; treat end_user as the optimistic bound "
+            f"and the ask as the realistic floor of a negotiation."
+        )
+    elif ask > comps_end_user * gap_high:
+        # Seller pricing far above model (conviction/moonshot ask)
+        triggered = True
+        verdict = "seller_above_model"
+        reason = (
+            f"live ask ${ask:,} is {1/ask_ratio:.1f}x above the comps-derived end_user "
+            f"${comps_end_user:,}. A conviction ask reflects the seller's belief rather than "
+            f"comparable transactions — premium listings sit unsold for years. The comps-anchored "
+            f"tiers are untouched."
+        )
+    else:
+        # Aligned: ask within threshold
+        return {
+            "ask": ask,
+            "comps_end_user": comps_end_user,
+            "ratio": round(ask_ratio, 2),
+            "verdict": "aligned"
+        }, None
+    
+    warning = None
+    if triggered:
+        # Cap confidence and widen end_user range when seller is below model
+        if verdict == "seller_below_model":
+            original_conf = inputs.comp_confidence
+            if original_conf > config.ASK_CONFLICT_CONF:
+                # Force confidence down
+                new_conf = config.ASK_CONFLICT_CONF
+                widen_factor = original_conf / new_conf
+                
+                # Widen end_user range DOWN so ask falls within or near low bound
+                if tiers.end_user:
+                    old_low_ratio = tiers.end_user.low / tiers.end_user.point if tiers.end_user.point > 0 else 0.7
+                    old_high_ratio = tiers.end_user.high / tiers.end_user.point if tiers.end_user.point > 0 else 1.4
+                    # Widen low bound more aggressively to encompass ask
+                    ask_low_ratio = ask / tiers.end_user.point if tiers.end_user.point > 0 else 0.3
+                    new_low_ratio = min(old_low_ratio / widen_factor, ask_low_ratio * 0.9)
+                    new_high_ratio = min(config.MAX_TIER_SPREAD, old_high_ratio * widen_factor)
+                    tiers.end_user.low = max(0, round(tiers.end_user.point * new_low_ratio))
+                    tiers.end_user.high = max(tiers.end_user.point, round(tiers.end_user.point * new_high_ratio))
+                    # Scale sale probability
+                    if tiers.end_user.sale_probability:
+                        tiers.end_user.sale_probability = round(
+                            tiers.end_user.sale_probability * new_conf / max(original_conf, 0.05), 4
+                        )
+                
+                warn(log, "tiers.ask_conflict",
+                     ask=ask,
+                     comps_end_user=comps_end_user,
+                     ratio=ask_ratio,
+                     verdict=verdict,
+                     original_confidence=original_conf,
+                     forced_confidence=new_conf)
+                
+                warning = (
+                    f"ask conflict: {reason} Confidence capped at {new_conf:.2f} and end_user "
+                    f"range widened down to encompass the ask."
+                )
+        else:
+            # Seller above model: note it, don't move tiers
+            info(log, "tiers.ask_above_model", ask=ask, comps_end_user=comps_end_user, ratio=1/ask_ratio)
+            warning = f"ask observation: {reason}"
+    
+    signals = {
+        "ask": ask,
+        "comps_end_user": comps_end_user,
+        "ratio": round(ask_ratio, 2),
+        "verdict": verdict
+    }
+    
+    return signals, warning
+
+
+def check_plausibility(inputs: TierInputs, tiers: TierSet) -> str | None:
+    """F17.2: Plausibility gate — catch comps-derived prices that are structurally wrong.
+    
+    When comps-derived end_user falls below the independent appraisal OR below
+    the category floor, the comps are likely misidentified (substring junk,
+    wrong quality band) rather than the market having collapsed.
+    
+    Returns a warning and forces confidence down to IMPLAUSIBLE_CONF, widening
+    ranges accordingly. Prevents "confident and wrong" (pay.ai $564 at conf 1.0).
+    """
+    from portfolio_agent.knowledge.category_floors import get_floor
+    
+    if tiers.end_user is None or tiers.end_user.point <= 0:
+        return None
+    
+    comps_end_user = tiers.end_user.point
+    triggered = []
+    
+    # Floor check: comps-derived price below independent appraisal
+    appraisal = inputs.independent_appraisal
+    if appraisal and appraisal.value > 0:
+        if comps_end_user < appraisal.value:
+            ratio = appraisal.value / comps_end_user
+            triggered.append(
+                f"comps-derived end_user (${comps_end_user:,}) is {ratio:.1f}x below the "
+                f"independent appraisal (${appraisal.value:,})"
+            )
+    
+    # Category floor check
+    category_floor = get_floor(inputs.category, inputs.tld)
+    if comps_end_user < category_floor:
+        ratio = category_floor / comps_end_user
+        triggered.append(
+            f"comps-derived end_user (${comps_end_user:,}) is {ratio:.1f}x below the "
+            f"plausibility floor for a {inputs.category} .{inputs.tld} (${category_floor:,})"
+        )
+    
+    if not triggered:
+        return None
+    
+    # Cap confidence across ALL tiers (they're all derived from the same comps)
+    original_conf = inputs.comp_confidence
+    if original_conf > config.IMPLAUSIBLE_CONF:
+        # Force confidence down
+        new_conf = config.IMPLAUSIBLE_CONF
+        # Widen all tier ranges proportionally
+        widen_factor = original_conf / new_conf
+        for tier in [tiers.floor, tiers.auction, tiers.end_user, tiers.list_bin]:
+            if tier and tier.point > 0:
+                # Widen the range symmetrically
+                old_low_ratio = tier.low / tier.point if tier.point > 0 else 0.7
+                old_high_ratio = tier.high / tier.point if tier.point > 0 else 1.4
+                new_low_ratio = max(0.01, old_low_ratio / widen_factor)
+                new_high_ratio = min(config.MAX_TIER_SPREAD, old_high_ratio * widen_factor)
+                tier.low = max(0, round(tier.point * new_low_ratio))
+                tier.high = max(tier.point, round(tier.point * new_high_ratio))
+                # Scale sale probability down
+                if tier.sale_probability:
+                    tier.sale_probability = round(tier.sale_probability * new_conf / max(original_conf, 0.05), 4)
+        
+        warn(log, "tiers.plausibility_gate_tripped", 
+             comps_end_user=comps_end_user,
+             category=inputs.category,
+             tld=inputs.tld,
+             category_floor=category_floor,
+             appraisal=appraisal.value if appraisal else None,
+             original_confidence=original_conf,
+             forced_confidence=new_conf,
+             triggers=len(triggered))
+        
+        reasons = "; ".join(triggered)
+        return (
+            f"plausibility gate: {reasons}. The comp set is likely misidentified, not the "
+            f"market. Confidence forced down from {original_conf:.2f} to {new_conf:.2f} and "
+            f"ranges widened accordingly. Never silently emit an implausible number."
+        )
+    
+    return None
 
 
 def enforce_tier_order(tiers: TierSet) -> list[str]:

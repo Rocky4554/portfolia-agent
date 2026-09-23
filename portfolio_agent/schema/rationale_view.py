@@ -295,6 +295,8 @@ def build_rationale_view(output: ValuationOutput) -> RationaleView:
                 "data_source": provenance,
                 "steps": [
                     {"from": LABELS.get(r.lower, r.lower), "to": LABELS.get(r.upper, r.upper),
+                     "from_point": getattr(output.tiers, r.lower).point if getattr(output.tiers, r.lower) else 0,
+                     "to_point": getattr(output.tiers, r.upper).point if getattr(output.tiers, r.upper) else 0,
                      "multiple": r.ratio, "magnitude": r.magnitude, "why": r.reason}
                     for r in relations
                 ],

@@ -67,33 +67,59 @@ async def get_registration(domain: str) -> ToolResult:
     if config.MOCK_MODE:
         return mock_result(SOURCE, _mock_registration(domain))
 
-    body, error = await request_json(
-        "GET", f"{_BOOTSTRAP}/{domain}",
-        headers={"Accept": "application/rdap+json"},
-        timeout=_TIMEOUT_S,
-        # rdap.org exists to redirect to the registry holding the record.
-        follow_redirects=True,
-    )
+    # F19.1: Try authoritative endpoint first for known ccTLDs with coverage gaps
+    from portfolio_agent.knowledge.rdap_endpoints import get_authoritative_endpoint
+    tld = domain.rsplit(".", 1)[-1]
+    authoritative_base = get_authoritative_endpoint(tld)
+    
+    body, error, source = None, None, "proxy"
+    
+    if authoritative_base:
+        # Try direct registry first for known problem TLDs
+        body, error = await request_json(
+            "GET", f"{authoritative_base.rstrip('/')}/domain/{domain}",
+            headers={"Accept": "application/rdap+json"},
+            timeout=_TIMEOUT_S,
+            follow_redirects=True,
+        )
+        if not error:
+            source = "authoritative"
+            info(log, "rdap.via_authoritative", domain=domain, base=authoritative_base)
+    
+    # Fall back to rdap.org proxy if authoritative endpoint failed or wasn't tried
+    if body is None and (error or not authoritative_base):
+        body, error = await request_json(
+            "GET", f"{_BOOTSTRAP}/{domain}",
+            headers={"Accept": "application/rdap+json"},
+            timeout=_TIMEOUT_S,
+            follow_redirects=True,
+        )
+        source = "proxy"
+    
+    # If rdap.org failed (but not with 404), try IANA bootstrap
     if error and "HTTP 404" not in error:
-        # rdap.org is one aggregator and a single point of failure. IANA
-        # publishes the authoritative TLD -> RDAP-server map, so when the
-        # aggregator is unreachable the registry can still be asked
-        # directly. Borrowed from name.ai's own whois route, which does the
-        # same thing for the same reason.
         direct, direct_error = await _via_iana_bootstrap(domain)
         if direct is not None:
             info(log, "rdap.via_bootstrap", domain=domain, aggregator_error=error)
-            body, error = direct, None
+            body, error, source = direct, None, "iana_bootstrap"
         else:
             debug(log, "rdap.bootstrap_failed", domain=domain, error=direct_error)
+    
     if error:
-        # A 404 from RDAP is a real answer: the registry has no record, so
-        # the domain is unregistered. Everything else is a failed lookup and
-        # must not be read as an answer.
+        # F19: A 404 from the PROXY (rdap.org) ≠ unregistered.
+        # Only treat as unregistered if it's from an authoritative source.
         if "HTTP 404" in error:
-            info(log, "rdap.unregistered", domain=domain)
-            return ok_result(SOURCE, _result(domain, registered=False))
+            if source == "authoritative" or source == "iana_bootstrap":
+                # Authoritative 404: domain genuinely unregistered
+                info(log, "rdap.unregistered", domain=domain, source=source)
+                return ok_result(SOURCE, _result(domain, registered=False))
+            else:
+                # Proxy 404: coverage gap, not a definitive answer
+                info(log, "rdap.unknown_via_proxy", domain=domain)
+                return ok_result(SOURCE, _result(domain, registered=None, 
+                                                status="unknown_via_rdap"))
         return error_result(SOURCE, error)
+    
     if not isinstance(body, dict):
         return error_result(SOURCE, f"RDAP returned {type(body).__name__}, expected an object")
 
@@ -180,13 +206,19 @@ def _parse(domain: str, body: dict) -> dict:
     )
 
 
-def _result(domain: str, *, registered: bool, registered_on: date | None = None,
+def _result(domain: str, *, registered: bool | None, registered_on: date | None = None,
             expires_on: date | None = None, registrar: str | None = None,
             statuses: list[str] | None = None, nameservers: list[str] | None = None,
-            registrant_available: bool = False) -> dict:
+            registrant_available: bool = False, status: str | None = None) -> dict:
+    """Build RDAP result dict.
+    
+    Args:
+        registered: True if registered, False if unregistered, None if unknown
+        status: Optional status string like "unknown_via_rdap" for F19
+    """
     statuses = statuses or []
     today = date.today()
-    return {
+    result = {
         "domain": domain,
         "registered": registered,
         "registered_on": registered_on.isoformat() if registered_on else None,
@@ -206,6 +238,9 @@ def _result(domain: str, *, registered: bool, registered_on: date | None = None,
         # other registries, so this is almost always False.
         "registrant_available": registrant_available,
     }
+    if status:
+        result["status"] = status
+    return result
 
 
 def _vcard_name(entity: dict) -> str | None:
