@@ -31,8 +31,10 @@ from dataclasses import dataclass, field
 from datetime import date
 
 from portfolio_agent import config
+from portfolio_agent.knowledge.category_floors import get_floor
 from portfolio_agent.knowledge.intent import classify_intent, volume_credit
 from portfolio_agent.knowledge.lexicon import EMERGING_TLDS, PREMIUM_TLDS
+from portfolio_agent.knowledge.tld_tier import get_tld_multiplier
 from portfolio_agent.logging_setup import debug, get_logger, info, warn
 from portfolio_agent.schema.valuation_output import (
     BrandScore,
@@ -796,35 +798,27 @@ def end_user_price(inputs: TierInputs, auction: PriceTier | None) -> tuple[Price
     # a reduced premium; high-brand, high-demand words keep it.
     if inputs.brand_score is not None:
         low, high = config.END_USER_BRAND_RANGE
-        base_brand_factor = low + (high - low) * (inputs.brand_score.total / 100.0)
-        
-        # Compute demand factor from commercial intent and category demand
-        resolved_intent = inputs.intent or {}
-        intent = resolved_intent.get("intent") or classify_intent(inputs.sld)[0]
-        # Check if intent is "commercial" (the only high-demand intent)
-        commercial_share = 1.0 if intent == "commercial" else 0.3
-        
-        # Category-specific demand (some categories inherently have more buyers)
-        category_demand = config.CATEGORY_LIQUIDITY.get(inputs.category, config.CATEGORY_LIQUIDITY_DEFAULT)
-        demand_factor = (commercial_share * 0.7 + category_demand * 0.3)
-        
-        # Effective brand multiplier = 1 + (brand_mult - 1) × demand_factor
-        # High brand + high demand: full premium (demand_factor ~1.0)
-        # High brand + low demand: reduced premium (demand_factor ~0.3-0.5)
-        effective_brand_factor = 1.0 + (base_brand_factor - 1.0) * demand_factor
-        
-        if demand_factor < 0.7:
-            adjustments.apply(
-                effective_brand_factor,
-                f"brand score {inputs.brand_score.total:.0f}/100, gated by demand "
-                f"(intent: {intent}, category liquidity: {category_demand:.2f}) — "
-                f"high-brand but low-demand words earn a reduced premium"
-            )
+        brand_factor = low + (high - low) * (inputs.brand_score.total / 100.0)
+        if not config.BRAND_DEMAND_GATE:
+            adjustments.apply(brand_factor, f"brand score {inputs.brand_score.total:.0f}/100")
         else:
-            adjustments.apply(
-                effective_brand_factor,
-                f"brand score {inputs.brand_score.total:.0f}/100"
-            )
+            intent = (inputs.intent or {}).get("intent") or classify_intent(inputs.sld)[0]
+            # Commercial is the only high-demand intent.
+            commercial_share = 1.0 if intent == "commercial" else 0.3
+            category_demand = config.CATEGORY_LIQUIDITY.get(inputs.category, config.CATEGORY_LIQUIDITY_DEFAULT)
+            demand_factor = commercial_share * 0.7 + category_demand * 0.3
+            # High brand + high demand keeps the full premium (demand_factor
+            # near 1.0); high brand + low demand keeps a fraction of it.
+            gated = 1.0 + (brand_factor - 1.0) * demand_factor
+            if demand_factor < 0.7:
+                adjustments.apply(
+                    gated,
+                    f"brand score {inputs.brand_score.total:.0f}/100, gated by demand "
+                    f"(intent: {intent}, category liquidity: {category_demand:.2f}) — "
+                    f"high-brand but low-demand words earn a reduced premium",
+                )
+            else:
+                adjustments.apply(gated, f"brand score {inputs.brand_score.total:.0f}/100")
 
     volume = _search_volume(inputs)
     if volume:
@@ -932,9 +926,10 @@ def end_user_price(inputs: TierInputs, auction: PriceTier | None) -> tuple[Price
     
     # F20.1: TLD discount — apply per-TLD multiplier after all other adjustments.
     # A great word on .co is still a .co. isotope.co should land near its comp
-    # median, not 4.7x above it.
-    from portfolio_agent.knowledge.tld_tier import get_tld_multiplier
-    tld_mult = get_tld_multiplier(inputs.tld)
+    # median, not 4.7x above it. Unmeasured, and the ladder already prices
+    # from same-extension comps, so this may count the extension twice —
+    # off until a backtest says otherwise.
+    tld_mult = get_tld_multiplier(inputs.tld) if config.TLD_TIER_DISCOUNT else 1.0
     if tld_mult != 1.0:
         adjustments.apply(
             tld_mult,
@@ -1041,18 +1036,6 @@ def list_bin_price(inputs: TierInputs, end_user: PriceTier | None) -> tuple[Pric
                 "is currently underpriced. The BIN is not capped to a figure under its own anchor, "
                 "so no tier was changed."
             )
-    
-    # F20.1: TLD discount — also apply to list_bin (it's a premium on end_user,
-    # which already has the discount, but the multiplier is explicit here for
-    # consistency and auditability).
-    from portfolio_agent.knowledge.tld_tier import get_tld_multiplier
-    tld_mult = get_tld_multiplier(inputs.tld)
-    if tld_mult != 1.0:
-        adjustments.apply(
-            tld_mult,
-            f".{inputs.tld} TLD discount (×{tld_mult:.2f}) — extension-specific pricing adjustment"
-        )
-        point = point * tld_mult
 
     markup = (point / end_user.point) if end_user.point else 1.0
 
@@ -1225,22 +1208,25 @@ def compute_market_tiers(inputs: TierInputs) -> tuple[TierSet, list[str]]:
     warnings.extend(listing_warnings)
 
     tiers = TierSet(floor=floor, auction=auction, end_user=end_user, list_bin=list_bin)
-    
+
     # F17.2: Plausibility gate — check comps-derived end_user against sanity bounds.
     # Runs BEFORE tier order enforcement so implausible comps get flagged even
-    # when they happen to sit in the right order.
-    plausibility_warning = check_plausibility(inputs, tiers)
-    if plausibility_warning:
-        warnings.append(plausibility_warning)
-    
+    # when they happen to sit in the right order. Either gate may lower
+    # inputs.comp_confidence, which is what the output reports.
+    if config.PLAUSIBILITY_GATE:
+        plausibility_warning = check_plausibility(inputs, tiers)
+        if plausibility_warning:
+            warnings.append(plausibility_warning)
+
     # F18.1: Ask reconciliation — cross-check live asking price against comps.
     # The ask never enters comps (WS3 quarantine), but a live seller pricing
     # this exact domain is strong evidence and must not be silently dropped.
-    ask_signals, ask_warning = check_ask_reconciliation(inputs, tiers)
-    if ask_warning:
-        warnings.append(ask_warning)
-    # TODO: Surface ask_signals in evidence for rationale to cite
-    
+    if config.ASK_RECONCILIATION:
+        # The signals dict is not read anywhere yet; only the warning reaches the report.
+        _, ask_warning = check_ask_reconciliation(inputs, tiers)
+        if ask_warning:
+            warnings.append(ask_warning)
+
     warnings.extend(enforce_tier_order(tiers))
 
     trend_warning = (inputs.trend or {}).get("staleness_warning")
@@ -1277,8 +1263,8 @@ def check_ask_reconciliation(inputs: TierInputs, tiers: TierSet) -> tuple[dict |
     The ask NEVER enters the comps (WS3 quarantine holds). It is a cross-check,
     not an input.
     
-    Returns (signals_dict, warning_str). The signals dict is surfaced in evidence
-    so the rationale can cite it.
+    Returns (signals_dict, warning_str). Lowers inputs.comp_confidence when it
+    caps, so the reported confidence matches the warning.
     """
     if tiers.end_user is None or tiers.end_user.point <= 0:
         return None, None
@@ -1331,6 +1317,9 @@ def check_ask_reconciliation(inputs: TierInputs, tiers: TierSet) -> tuple[dict |
         # Cap confidence and widen end_user range when seller is below model
         if verdict == "seller_below_model":
             original_conf = inputs.comp_confidence
+            # Already at or under the cap: nothing to move, but the conflict
+            # is still reported.
+            warning = f"ask conflict: {reason} Confidence is already {original_conf:.2f}."
             if original_conf > config.ASK_CONFLICT_CONF:
                 # Force confidence down
                 new_conf = config.ASK_CONFLICT_CONF
@@ -1352,6 +1341,7 @@ def check_ask_reconciliation(inputs: TierInputs, tiers: TierSet) -> tuple[dict |
                             tiers.end_user.sale_probability * new_conf / max(original_conf, 0.05), 4
                         )
                 
+                inputs.comp_confidence = new_conf
                 warn(log, "tiers.ask_conflict",
                      ask=ask,
                      comps_end_user=comps_end_user,
@@ -1386,11 +1376,9 @@ def check_plausibility(inputs: TierInputs, tiers: TierSet) -> str | None:
     the category floor, the comps are likely misidentified (substring junk,
     wrong quality band) rather than the market having collapsed.
     
-    Returns a warning and forces confidence down to IMPLAUSIBLE_CONF, widening
-    ranges accordingly. Prevents "confident and wrong" (pay.ai $564 at conf 1.0).
+    Returns a warning and forces inputs.comp_confidence down to IMPLAUSIBLE_CONF,
+    widening ranges accordingly. Prevents "confident and wrong" (pay.ai $564 at conf 1.0).
     """
-    from portfolio_agent.knowledge.category_floors import get_floor
-    
     if tiers.end_user is None or tiers.end_user.point <= 0:
         return None
     
@@ -1418,45 +1406,49 @@ def check_plausibility(inputs: TierInputs, tiers: TierSet) -> str | None:
     
     if not triggered:
         return None
-    
+
+    reasons = "; ".join(triggered)
     # Cap confidence across ALL tiers (they're all derived from the same comps)
     original_conf = inputs.comp_confidence
-    if original_conf > config.IMPLAUSIBLE_CONF:
-        # Force confidence down
-        new_conf = config.IMPLAUSIBLE_CONF
-        # Widen all tier ranges proportionally
-        widen_factor = original_conf / new_conf
-        for tier in [tiers.floor, tiers.auction, tiers.end_user, tiers.list_bin]:
-            if tier and tier.point > 0:
-                # Widen the range symmetrically
-                old_low_ratio = tier.low / tier.point if tier.point > 0 else 0.7
-                old_high_ratio = tier.high / tier.point if tier.point > 0 else 1.4
-                new_low_ratio = max(0.01, old_low_ratio / widen_factor)
-                new_high_ratio = min(config.MAX_TIER_SPREAD, old_high_ratio * widen_factor)
-                tier.low = max(0, round(tier.point * new_low_ratio))
-                tier.high = max(tier.point, round(tier.point * new_high_ratio))
-                # Scale sale probability down
-                if tier.sale_probability:
-                    tier.sale_probability = round(tier.sale_probability * new_conf / max(original_conf, 0.05), 4)
-        
-        warn(log, "tiers.plausibility_gate_tripped", 
-             comps_end_user=comps_end_user,
-             category=inputs.category,
-             tld=inputs.tld,
-             category_floor=category_floor,
-             appraisal=appraisal.value if appraisal else None,
-             original_confidence=original_conf,
-             forced_confidence=new_conf,
-             triggers=len(triggered))
-        
-        reasons = "; ".join(triggered)
+    if original_conf <= config.IMPLAUSIBLE_CONF:
         return (
             f"plausibility gate: {reasons}. The comp set is likely misidentified, not the "
-            f"market. Confidence forced down from {original_conf:.2f} to {new_conf:.2f} and "
-            f"ranges widened accordingly. Never silently emit an implausible number."
+            f"market. Confidence is already {original_conf:.2f}."
         )
+    # Force confidence down
+    new_conf = config.IMPLAUSIBLE_CONF
+    # Widen all tier ranges proportionally
+    widen_factor = original_conf / new_conf
+    for tier in [tiers.floor, tiers.auction, tiers.end_user, tiers.list_bin]:
+        if tier and tier.point > 0:
+            # Widen the range symmetrically
+            old_low_ratio = tier.low / tier.point if tier.point > 0 else 0.7
+            old_high_ratio = tier.high / tier.point if tier.point > 0 else 1.4
+            new_low_ratio = max(0.01, old_low_ratio / widen_factor)
+            new_high_ratio = min(config.MAX_TIER_SPREAD, old_high_ratio * widen_factor)
+            tier.low = max(0, round(tier.point * new_low_ratio))
+            tier.high = max(tier.point, round(tier.point * new_high_ratio))
+            # Scale sale probability down
+            if tier.sale_probability:
+                tier.sale_probability = round(tier.sale_probability * new_conf / max(original_conf, 0.05), 4)
     
-    return None
+    inputs.comp_confidence = new_conf
+    warn(log, "tiers.plausibility_gate_tripped",
+         comps_end_user=comps_end_user,
+         category=inputs.category,
+         tld=inputs.tld,
+         category_floor=category_floor,
+         appraisal=appraisal.value if appraisal else None,
+         original_confidence=original_conf,
+         forced_confidence=new_conf,
+         triggers=len(triggered))
+
+    return (
+        f"plausibility gate: {reasons}. The comp set is likely misidentified, not the "
+        f"market. Confidence forced down from {original_conf:.2f} to {new_conf:.2f} and "
+        f"ranges widened accordingly. Never silently emit an implausible number."
+    )
+
 
 
 def enforce_tier_order(tiers: TierSet) -> list[str]:

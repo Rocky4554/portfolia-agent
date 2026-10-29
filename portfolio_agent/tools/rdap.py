@@ -67,59 +67,43 @@ async def get_registration(domain: str) -> ToolResult:
     if config.MOCK_MODE:
         return mock_result(SOURCE, _mock_registration(domain))
 
-    # F19.1: Try authoritative endpoint first for known ccTLDs with coverage gaps
-    from portfolio_agent.knowledge.rdap_endpoints import get_authoritative_endpoint
-    tld = domain.rsplit(".", 1)[-1]
-    authoritative_base = get_authoritative_endpoint(tld)
-    
-    body, error, source = None, None, "proxy"
-    
-    if authoritative_base:
-        # Try direct registry first for known problem TLDs
-        body, error = await request_json(
-            "GET", f"{authoritative_base.rstrip('/')}/domain/{domain}",
-            headers={"Accept": "application/rdap+json"},
-            timeout=_TIMEOUT_S,
-            follow_redirects=True,
-        )
-        if not error:
-            source = "authoritative"
-            info(log, "rdap.via_authoritative", domain=domain, base=authoritative_base)
-    
-    # Fall back to rdap.org proxy if authoritative endpoint failed or wasn't tried
-    if body is None and (error or not authoritative_base):
-        body, error = await request_json(
-            "GET", f"{_BOOTSTRAP}/{domain}",
-            headers={"Accept": "application/rdap+json"},
-            timeout=_TIMEOUT_S,
-            follow_redirects=True,
-        )
-        source = "proxy"
-    
-    # If rdap.org failed (but not with 404), try IANA bootstrap
+    body, error = await request_json(
+        "GET", f"{_BOOTSTRAP}/{domain}",
+        headers={"Accept": "application/rdap+json"},
+        timeout=_TIMEOUT_S,
+        # rdap.org exists to redirect to the registry holding the record.
+        follow_redirects=True,
+    )
     if error and "HTTP 404" not in error:
+        # rdap.org is one aggregator and a single point of failure. IANA
+        # publishes the authoritative TLD -> RDAP-server map, so when the
+        # aggregator is unreachable the registry can still be asked
+        # directly. Borrowed from name.ai's own whois route, which does the
+        # same thing for the same reason.
         direct, direct_error = await _via_iana_bootstrap(domain)
         if direct is not None:
             info(log, "rdap.via_bootstrap", domain=domain, aggregator_error=error)
-            body, error, source = direct, None, "iana_bootstrap"
+            body, error = direct, None
         else:
             debug(log, "rdap.bootstrap_failed", domain=domain, error=direct_error)
-    
     if error:
-        # F19: A 404 from the PROXY (rdap.org) ≠ unregistered.
-        # Only treat as unregistered if it's from an authoritative source.
         if "HTTP 404" in error:
-            if source == "authoritative" or source == "iana_bootstrap":
-                # Authoritative 404: domain genuinely unregistered
-                info(log, "rdap.unregistered", domain=domain, source=source)
+            # rdap.org answers 404 for two different things: a domain the
+            # registry has no record of, and a TLD with no RDAP service at
+            # all. isotope.co was the second — .co and .io have no entry in
+            # IANA's bootstrap, so the 404 said nothing about the domain.
+            # Only a TLD that IANA lists can have its 404 read as
+            # unregistered.
+            index, index_error = await _bootstrap_index()
+            tld = domain.rsplit(".", 1)[-1]
+            if index is not None and tld in index:
+                info(log, "rdap.unregistered", domain=domain)
                 return ok_result(SOURCE, _result(domain, registered=False))
-            else:
-                # Proxy 404: coverage gap, not a definitive answer
-                info(log, "rdap.unknown_via_proxy", domain=domain)
-                return ok_result(SOURCE, _result(domain, registered=None, 
-                                                status="unknown_via_rdap"))
+            info(log, "rdap.unknown_no_service", domain=domain,
+                 reason=index_error or f"IANA lists no RDAP server for .{tld}")
+            return ok_result(SOURCE, _result(domain, registered=None, status="unknown_via_rdap"))
         return error_result(SOURCE, error)
-    
+
     if not isinstance(body, dict):
         return error_result(SOURCE, f"RDAP returned {type(body).__name__}, expected an object")
 
@@ -133,17 +117,9 @@ _bootstrap_cache: dict[str, str] | None = None
 _IANA_BOOTSTRAP = "https://data.iana.org/rdap/dns.json"
 
 
-async def _via_iana_bootstrap(domain: str) -> tuple[dict | None, str | None]:
-    """Ask the registry that actually holds the record.
-
-    IANA publishes which RDAP server is authoritative for each TLD. Not
-    every extension is listed — .io is absent today — so this is a fallback
-    that can itself decline, which is why it returns an error rather than
-    raising.
-    """
+async def _bootstrap_index() -> tuple[dict[str, str] | None, str | None]:
+    """IANA's TLD -> RDAP server map, fetched once per process."""
     global _bootstrap_cache
-    tld = domain.rsplit(".", 1)[-1]
-
     if _bootstrap_cache is None:
         body, error = await request_json(
             "GET", _IANA_BOOTSTRAP, timeout=_TIMEOUT_S, max_attempts=1)
@@ -158,8 +134,23 @@ async def _via_iana_bootstrap(domain: str) -> tuple[dict | None, str | None]:
                         index[str(name).lower()] = str(urls[0])
         # Cached for the process: IANA publishes this file roughly weekly.
         _bootstrap_cache = index
+    return _bootstrap_cache, None
 
-    base = _bootstrap_cache.get(tld.lower())
+
+async def _via_iana_bootstrap(domain: str) -> tuple[dict | None, str | None]:
+    """Ask the registry that actually holds the record.
+
+    IANA publishes which RDAP server is authoritative for each TLD. Not
+    every extension is listed — .io is absent today — so this is a fallback
+    that can itself decline, which is why it returns an error rather than
+    raising.
+    """
+    tld = domain.rsplit(".", 1)[-1]
+    index, error = await _bootstrap_index()
+    if index is None:
+        return None, error
+
+    base = index.get(tld.lower())
     if not base:
         return None, f"IANA lists no RDAP server for .{tld}"
     body, error = await request_json(

@@ -282,6 +282,21 @@ CATEGORY_KILLER_MIN_CASES = 3
 # substring comps comes out near $9,000 against a real $35.6M sale.
 APPRAISAL_DISAGREEMENT_FACTOR = 10.0
 
+# The F17–F20 corrections are hand-set priors that no backtest has measured
+# yet, and each one moves prices. Off, the engine behaves as it did before
+# them; on, each can be scored against held-out sales with
+# evals/backtest.py and kept only if the numbers improve.
+#   STRICT_EXACT_MATCH  F17.1  a one-word subject's exact comps must be the same word
+#   PLAUSIBILITY_GATE   F17.2  cap confidence when comps land under the appraisal or floor
+#   ASK_RECONCILIATION  F18    cap confidence when a live ask sits far below the comps
+#   BRAND_DEMAND_GATE   F20.1  shrink the brand premium for low-demand words
+#   TLD_TIER_DISCOUNT   F20.1  per-extension multiplier on end_user
+STRICT_EXACT_MATCH = _flag("PORTFOLIO_AGENT_STRICT_EXACT_MATCH")
+PLAUSIBILITY_GATE = _flag("PORTFOLIO_AGENT_PLAUSIBILITY_GATE")
+ASK_RECONCILIATION = _flag("PORTFOLIO_AGENT_ASK_RECONCILIATION")
+BRAND_DEMAND_GATE = _flag("PORTFOLIO_AGENT_BRAND_DEMAND_GATE")
+TLD_TIER_DISCOUNT = _flag("PORTFOLIO_AGENT_TLD_TIER_DISCOUNT")
+
 # F17.2: Plausibility gate — confidence cap when comps are implausible.
 # When comps-derived end_user falls below the independent appraisal OR below
 # the category floor, confidence is capped at this level regardless of stated

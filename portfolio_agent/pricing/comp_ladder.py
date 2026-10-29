@@ -397,7 +397,7 @@ def _is_exact_match(subject_sld: str, comp_sld: str, terms: list[str]) -> bool:
     SAME SLD, not merely contain the subject term. Allowed equivalences:
     - Exact equality: pay == pay
     - Plural variants: isotope == isotopes
-    - Hyphen variants: pay == pay-pal is NOT equal (different word)
+    The caller has already dropped comps on other extensions.
     
     Multi-token subjects use the old substring logic since they're already
     compound names where the keyword appearing is meaningful.
@@ -437,10 +437,10 @@ def _step_exact(inputs: LadderInputs) -> list[CompRef]:
     `exact` at confidence 1.0, and never reached for the cohort that
     actually defines its class. Ten neighbours read as certainty.
 
-    A comp qualifies here only if it is the SAME asset class — for a
-    single-token subject, the SLD must equal the subject SLD (different TLD
-    allowed) OR match under a defined equivalence (plural/hyphen).
-    paydayloans.ai is NOT an exact comp for pay.ai — it's a different SLD.
+    A comp qualifies here only if the term appears in it, or it is the same
+    name on the same extension. With STRICT_EXACT_MATCH on, a single-token
+    subject is held to more: the comp's SLD must equal the subject's, or be
+    its plural. paydayloans.ai is then not an exact comp for pay.ai.
     Everything else is a cohort member and is priced as one, at cohort
     confidence.
     """
@@ -461,8 +461,12 @@ def _step_exact(inputs: LadderInputs) -> list[CompRef]:
             # F17.1: Exact match means SAME ASSET CLASS, not "substring appears".
             # For a single-token subject, the comp's SLD must equal the subject
             # SLD or match under defined equivalence (plural, hyphen variants).
-            if not _is_exact_match(inputs.sld, sld, terms):
-                rejected_substring += 1
+            # Off by default until a backtest shows it helps.
+            if config.STRICT_EXACT_MATCH:
+                if not _is_exact_match(inputs.sld, sld, terms):
+                    rejected_substring += 1
+                    continue
+            elif not any(term in sld for term in terms):
                 continue
         comps.append(
             _comp(

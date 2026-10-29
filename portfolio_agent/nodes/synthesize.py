@@ -526,8 +526,12 @@ def build_valuation(state: PortfolioAgentState) -> ValuationOutput:
         kept = [ref for ref in inputs.evidence_refs.get("comps", []) if ref in succeeded]
         inputs.evidence_refs["comps"] = [acquisition_ref] + kept
 
+    confidence_in = inputs.comp_confidence
     tiers, tier_warnings = compute_market_tiers(inputs)
     warnings.extend(tier_warnings)
+    # The plausibility and ask gates lower inputs.comp_confidence when they
+    # trip. That is the cap the warning announces, so it is what the report shows.
+    gate_cap = inputs.comp_confidence if inputs.comp_confidence < confidence_in else None
 
     # The two conditional tiers. Both commonly return None, and that is the
     # correct outcome: a targeted price with no identified buyer, or a
@@ -606,6 +610,8 @@ def build_valuation(state: PortfolioAgentState) -> ValuationOutput:
         ]
         comp_basis = CompBasis.CATEGORY_DEFINING
         comp_confidence = config.COMP_BASIS_CONFIDENCE["category_defining"]
+    if gate_cap is not None:
+        comp_confidence = min(comp_confidence, gate_cap)
 
     acquirability, acquirability_warnings = _acquirability(state.get("tool_results") or {})
     warnings.extend(acquirability_warnings)

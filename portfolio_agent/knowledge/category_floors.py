@@ -77,17 +77,10 @@ def get_floor(category: str, tld: str) -> int:
     category = (category or "").lower().strip()
     tld = (tld or "").lower().strip()
     
-    # Try exact match first
-    key = (category, tld)
-    if key in CATEGORY_FLOORS:
-        return CATEGORY_FLOORS[key]
-    
-    # Fall back to category with wildcard TLD
-    for cat, t in CATEGORY_FLOORS:
-        if cat == category:
-            return CATEGORY_FLOORS[(cat, t)]
-    
-    return DEFAULT_FLOOR
+    # No borrowing another extension's floor: the first entry for a category
+    # is its .com floor, and a generic .xyz held to $5,000 trips on almost
+    # every name.
+    return CATEGORY_FLOORS.get((category, tld), DEFAULT_FLOOR)
 
 
 def get_ceiling(category: str, tld: str) -> int | None:
